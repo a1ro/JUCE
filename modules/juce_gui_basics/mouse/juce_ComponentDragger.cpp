@@ -48,6 +48,11 @@ void ComponentDragger::startDraggingComponent (Component* const componentToDrag,
         mouseDownWithinTarget = e.getEventRelativeTo (componentToDrag).getMouseDownPosition();
 }
 
+void ComponentDragger::updateMouseDownPosition (Point<int> positionWithinTarget)
+{
+    mouseDownWithinTarget = positionWithinTarget;
+}
+
 void ComponentDragger::dragComponent (Component* const componentToDrag, const MouseEvent& e,
                                       ComponentBoundsConstrainer* const constrainer)
 {

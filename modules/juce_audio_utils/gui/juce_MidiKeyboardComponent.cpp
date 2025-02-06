@@ -467,13 +467,13 @@ void MidiKeyboardComponent::colourChanged()
 void MidiKeyboardComponent::drawWhiteKey (int midiNoteNumber, Graphics& g, Rectangle<float> area)
 {
     drawWhiteNote (midiNoteNumber, g, area, state.isNoteOnForChannels (midiInChannelMask, midiNoteNumber),
-                   mouseOverNotes.contains (midiNoteNumber), findColour (keySeparatorLineColourId), findColour (textLabelColourId));
+                   mouseOverNotes.contains (midiNoteNumber));
 }
 
 void MidiKeyboardComponent::drawBlackKey (int midiNoteNumber, Graphics& g, Rectangle<float> area)
 {
     drawBlackNote (midiNoteNumber, g, area, state.isNoteOnForChannels (midiInChannelMask, midiNoteNumber),
-                   mouseOverNotes.contains (midiNoteNumber), findColour (blackNoteColourId));
+                   mouseOverNotes.contains (midiNoteNumber));
 }
 
 //==============================================================================

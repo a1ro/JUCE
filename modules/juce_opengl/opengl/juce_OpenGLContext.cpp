@@ -112,36 +112,24 @@ class OpenGLContext::CachedImage final : public CachedComponentImage
         double scale;
 
         auto tie() const { return std::tie (area, scale); }
-
-        auto operator== (const AreaAndScale& other) const { return tie() == other.tie(); }
-        auto operator!= (const AreaAndScale& other) const { return tie() != other.tie(); }
-    };
-
-    class LockedAreaAndScale
-    {
-    public:
+        
         auto get() const
         {
-            const ScopedLock lock (mutex);
-            return data;
+            return *this;
         }
 
         template <typename Fn>
         void set (const AreaAndScale& d, Fn&& ifDifferent)
         {
-            const auto old = [&]
-            {
-                const ScopedLock lock (mutex);
-                return std::exchange (data, d);
-            }();
-
-            if (old != d)
+            if (d.area != area || d.scale != scale) {
+                area = d.area;
+                scale = d.scale;
                 ifDifferent();
+            }
         }
 
-    private:
-        CriticalSection mutex;
-        AreaAndScale data { {}, 1.0 };
+        auto operator== (const AreaAndScale& other) const { return tie() == other.tie(); }
+        auto operator!= (const AreaAndScale& other) const { return tie() != other.tie(); }
     };
 
 public:
@@ -157,62 +145,11 @@ public:
             context.nativeContext = nativeContext.get();
         else
             nativeContext.reset();
-
-        refreshDisplayLinkConnection();
     }
 
     ~CachedImage() override
     {
-        stop();
-    }
-
-    //==============================================================================
-    void start()
-    {
-        if (nativeContext != nullptr)
-            resume();
-    }
-
-    void stop()
-    {
-        // make sure everything has finished executing
-        state |= StateFlags::pendingDestruction;
-
-        if (workQueue.size() > 0)
-        {
-            if (! renderThread->contains (this))
-                resume();
-
-            while (workQueue.size() != 0)
-                Thread::sleep (20);
-        }
-
-        pause();
-    }
-
-    //==============================================================================
-    void pause()
-    {
-        renderThread->remove (this);
-
-        if ((state.fetch_and (~StateFlags::initialised) & StateFlags::initialised) == 0)
-            return;
-
-        ScopedContextActivator activator;
-        activator.activate (context);
-
-        if (context.renderer != nullptr)
-            context.renderer->openGLContextClosing();
-
-        associatedObjectNames.clear();
-        associatedObjects.clear();
-        cachedImageFrameBuffer.release();
-        nativeContext->shutdownOnRenderThread();
-    }
-
-    void resume()
-    {
-        renderThread->add (this);
+        releaseResources();
     }
 
     //==============================================================================
@@ -237,26 +174,29 @@ public:
     bool invalidateAll() override
     {
         validArea.clear();
-        triggerRepaint();
         return false;
     }
 
     bool invalidate (const Rectangle<int>& area) override
     {
         validArea.subtract (area.toFloat().transformedBy (transform).getSmallestIntegerContainer());
-        triggerRepaint();
         return false;
     }
 
     void releaseResources() override
     {
-        stop();
-    }
+        state |= StateFlags::pendingDestruction;
+        
+        ScopedContextActivator activator;
+        activator.activate (context);
 
-    void triggerRepaint()
-    {
-        state |= (StateFlags::pendingRender | StateFlags::paintComponents);
-        renderThread->triggerRepaint();
+        if (context.renderer != nullptr)
+            context.renderer->openGLContextClosing();
+
+        associatedObjectNames.clear();
+        associatedObjects.clear();
+        cachedImageFrameBuffer.release();
+        nativeContext->shutdownOnRenderThread();
     }
 
     //==============================================================================
@@ -609,10 +549,6 @@ public:
         if (isFlagSet (state, StateFlags::initialised))
         {
             [nativeContext->view update];
-
-            // We're already on the message thread, no need to lock it again.
-            MessageManager::Lock mml;
-            renderFrame (mml);
         }
        #endif
     }
@@ -657,7 +593,7 @@ public:
         const auto currentViewportArea = areaAndScale.get().area;
         glViewport (0, 0, currentViewportArea.getWidth(), currentViewportArea.getHeight());
 
-        nativeContext->setSwapInterval (1);
+        nativeContext->setSwapInterval (0);
 
        #if ! JUCE_OPENGL_ES
         JUCE_CHECK_OPENGL_ERROR
@@ -666,75 +602,12 @@ public:
        #endif
 
         textureNpotSupported = contextHasTextureNpotFeature();
+        isInitialised = true;
 
         if (context.renderer != nullptr)
             context.renderer->newOpenGLContextCreated();
 
         return InitResult::success;
-    }
-
-    //==============================================================================
-    struct BlockingWorker final : public OpenGLContext::AsyncWorker
-    {
-        BlockingWorker (OpenGLContext::AsyncWorker::Ptr && workerToUse)
-            : originalWorker (std::move (workerToUse))
-        {}
-
-        void operator() (OpenGLContext& calleeContext) override
-        {
-            if (originalWorker != nullptr)
-                (*originalWorker) (calleeContext);
-
-            finishedSignal.signal();
-        }
-
-        void block() noexcept  { finishedSignal.wait(); }
-
-        OpenGLContext::AsyncWorker::Ptr originalWorker;
-        WaitableEvent finishedSignal;
-    };
-
-    void doWorkWhileWaitingForLock (ScopedContextActivator& contextActivator)
-    {
-        while (const auto work = workQueue.removeAndReturn (0))
-        {
-            if (renderThread->isListChanging() || ! contextActivator.activate (context))
-                break;
-
-            NativeContext::Locker locker (*nativeContext);
-
-            (*work) (context);
-            clearGLError();
-        }
-    }
-
-    void execute (OpenGLContext::AsyncWorker::Ptr workerToUse, bool shouldBlock)
-    {
-        if (! isFlagSet (state, StateFlags::pendingDestruction))
-        {
-            if (shouldBlock)
-            {
-                auto blocker = new BlockingWorker (std::move (workerToUse));
-                OpenGLContext::AsyncWorker::Ptr worker (*blocker);
-                workQueue.add (worker);
-
-                renderThread->abortLock();
-                context.triggerRepaint();
-
-                blocker->block();
-            }
-            else
-            {
-                workQueue.add (std::move (workerToUse));
-
-                renderThread->abortLock();
-                context.triggerRepaint();
-            }
-        }
-        else
-        {
-            jassertfalse; // you called execute AFTER you detached your OpenGLContext
-        }
     }
 
     //==============================================================================
@@ -963,13 +836,11 @@ public:
     OpenGLContext& context;
     Component& component;
 
-    SharedResourcePointer<RenderThread> renderThread;
-
     OpenGLFrameBuffer cachedImageFrameBuffer;
     RectangleList<int> validArea;
     Rectangle<int> lastScreenBounds;
     AffineTransform transform;
-    LockedAreaAndScale areaAndScale;
+    AreaAndScale areaAndScale;
 
     StringArray associatedObjectNames;
     ReferenceCountedArray<ReferenceCountedObject> associatedObjects;
@@ -981,8 +852,7 @@ public:
     bool shadersAvailable = false;
    #endif
     bool textureNpotSupported = false;
-    std::chrono::steady_clock::time_point lastMMLockReleaseTime{};
-    BufferSwapper bufferSwapper { *this };
+    bool isInitialised = false;
 
    #if JUCE_MAC
     NSView* getCurrentView() const
@@ -1066,7 +936,6 @@ public:
     };
 
     std::atomic<int> state { 0 };
-    ReferenceCountedArray<OpenGLContext::AsyncWorker, CriticalSection> workQueue;
 
    #if JUCE_IOS
     iOSBackgroundProcessCheck backgroundProcessCheck;
@@ -1091,6 +960,23 @@ public:
     {
         detach();
     }
+    
+    void setVisible(bool shouldBeVisible)
+    {
+        if(shouldBeVisible && isHidden){
+            isHidden = false;
+            start();
+            componentMovedOrResized(true, true);
+            componentVisibilityChanged();
+        } else if (!shouldBeVisible && !isHidden) {
+            isHidden = true;
+            auto& comp = *getComponent();
+            stop();
+            if (isAttached (comp)) {
+                context.nativeContext->updateWindowPosition(Rectangle<int>(0, 0, 0, 0));
+            }
+        }
+    }
 
     void detach()
     {
@@ -1108,8 +994,9 @@ public:
             componentVisibilityChanged();
 
         if (comp.getWidth() > 0 && comp.getHeight() > 0
-             && context.nativeContext != nullptr)
+             && context.nativeContext != nullptr && !context.attachment->isHidden)
         {
+            
             if (auto* c = CachedImage::get (comp))
                 c->handleResize();
 
@@ -1159,6 +1046,7 @@ public:
 
 private:
     OpenGLContext& context;
+    bool isHidden = false;
 
     bool canBeAttached (const Component& comp) noexcept
     {
@@ -1188,7 +1076,6 @@ private:
                                                 context.openGLPixelFormat,
                                                 context.contextToShareWith);
         comp.setCachedComponentImage (newCachedImage);
-
         start();
     }
 
@@ -1204,9 +1091,6 @@ private:
         [[(NSView*) comp.getWindowHandle() window] disableScreenUpdatesUntilFlush];
         #endif
        #endif
-
-        if (auto* oldCachedImage = CachedImage::get (comp))
-            oldCachedImage->stop(); // (must stop this before detaching it from the component)
     }
 
     void start()
@@ -1215,9 +1099,7 @@ private:
 
         if (auto* cachedImage = CachedImage::get (comp))
         {
-            cachedImage->start(); // (must wait until this is attached before starting its thread)
             cachedImage->updateViewportSize();
-
             startTimer (400);
         }
     }
@@ -1269,12 +1151,7 @@ void OpenGLContext::setContinuousRepainting (bool shouldContinuouslyRepaint) noe
         detach();
         attachment.reset (new Attachment (*this, *component));
     }
-
-    if (auto* cachedImage = getCachedImage())
-        cachedImage->refreshDisplayLinkConnection();
    #endif
-
-    triggerRepaint();
 }
 
 void OpenGLContext::setPixelFormat (const OpenGLPixelFormat& preferredPixelFormat) noexcept
@@ -1322,6 +1199,14 @@ void OpenGLContext::attachTo (Component& component)
     {
         detach();
         attachment.reset (new Attachment (*this, component));
+    }
+}
+
+void OpenGLContext::setVisible(bool shouldBeVisible)
+{
+    if (auto* a = attachment.get())
+    {
+        a->setVisible(shouldBeVisible); // must detach before nulling our pointer
     }
 }
 
@@ -1386,17 +1271,17 @@ void OpenGLContext::deactivateCurrentContext()
     currentThreadActiveContext = nullptr;
 }
 
-void OpenGLContext::triggerRepaint()
-{
-    if (auto* cachedImage = getCachedImage())
-        cachedImage->triggerRepaint();
-}
-
 void OpenGLContext::swapBuffers()
 {
     if (nativeContext != nullptr)
         nativeContext->swapBuffers();
 }
+
+double OpenGLContext::getRenderingScale() const noexcept
+{
+    return getCachedImage()->areaAndScale.scale;
+}
+
 
 unsigned int OpenGLContext::getFrameBufferID() const noexcept
 {
@@ -1430,6 +1315,15 @@ OpenGLContext::CachedImage* OpenGLContext::getCachedImage() const noexcept
         return CachedImage::get (*comp);
 
     return nullptr;
+}
+
+
+void OpenGLContext::initialiseOnThread()
+{
+    auto* c = getCachedImage();
+    if(c && !c->isInitialised) {
+        c->initialiseOnThread();
+    }
 }
 
 bool OpenGLContext::areShadersAvailable() const
@@ -1492,14 +1386,6 @@ void OpenGLContext::setAssociatedObject (const char* name, ReferenceCountedObjec
 
 void OpenGLContext::setImageCacheSize (size_t newSize) noexcept     { imageCacheMaxSize = newSize; }
 size_t OpenGLContext::getImageCacheSize() const noexcept            { return imageCacheMaxSize; }
-
-void OpenGLContext::execute (OpenGLContext::AsyncWorker::Ptr workerToUse, bool shouldBlock)
-{
-    if (auto* c = getCachedImage())
-        c->execute (std::move (workerToUse), shouldBlock);
-    else
-        jassertfalse; // You must have attached the context to a component
-}
 
 //==============================================================================
 struct DepthTestDisabler
@@ -1691,25 +1577,14 @@ void OpenGLContext::NativeContext::surfaceCreated (LocalRef<jobject>)
         context.reset (eglCreateContext (display, config, EGL_NO_CONTEXT, contextAttribs));
         jassert (context.get() != EGL_NO_CONTEXT);
     }
-
-    if (auto* cached = CachedImage::get (component))
-    {
-        cached->resume();
-        cached->triggerRepaint();
-    }
 }
 
 void OpenGLContext::NativeContext::surfaceDestroyed (LocalRef<jobject>)
 {
-    if (auto* cached = CachedImage::get (component))
-        cached->pause();
+    const std::lock_guard lock { nativeHandleMutex };
 
-    {
-        const std::lock_guard lock { nativeHandleMutex };
-
-        context.reset (EGL_NO_CONTEXT);
-        surface.reset (EGL_NO_SURFACE);
-    }
+    context.reset (EGL_NO_CONTEXT);
+    surface.reset (EGL_NO_SURFACE);
 }
 
 #endif
